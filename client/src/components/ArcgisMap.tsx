@@ -1,6 +1,13 @@
 /// <reference types="@arcgis/map-components/types/react" />
-import { useCollegesUniversities } from "../useContext/collegesUniversitiesContext";
-import { useRef } from "react";
+import {
+  useCollegesUniversities,
+  type AreaInstitution,
+} from "../useContext/collegesUniversitiesContext";
+import { useSavedUniversities } from "../useContext/savedUniversitiesContext";
+import { useEffect, useRef } from "react";
+import * as reactiveUtils from "@arcgis/core/core/reactiveUtils.js";
+import type ActionButton from "@arcgis/core/support/actions/ActionButton.js";
+import type { ResourceHandle } from "@arcgis/core/core/Handles.js";
 import FeatureLayer from "@arcgis/core/layers/FeatureLayer.js";
 import Geometry from "@arcgis/core/geometry/Geometry.js";
 import MapView from "@arcgis/core/views/MapView.js";
@@ -30,8 +37,21 @@ const INSTITUTION_OUT_FIELDS = [
 // The service returns at most this many features per query.
 const MAX_RECORD_COUNT = 2000;
 
+const SAVE_ACTION_ID = "toggle-save";
+
 const INSTITUTION_POPUP_TEMPLATE = {
   title: "{INSTNM}",
+  // A clicked feature only carries the fields its popup template asks for.
+  // UNITID is never displayed, so without this the save button has no id.
+  outFields: [...INSTITUTION_OUT_FIELDS],
+  actions: [
+    {
+      type: "button" as const,
+      id: SAVE_ACTION_ID,
+      title: "Save university",
+      icon: "heart" as const,
+    },
+  ],
   content: [
     {
       type: "fields" as const,
@@ -53,6 +73,23 @@ function normalizeWebsite(value: unknown): string | undefined {
   return /^https?:\/\//i.test(website) ? website : `https://${website}`;
 }
 
+// Shared by the sketch results and the popup's save button, so a university
+// is saved with the same shape wherever the user found it.
+function toAreaInstitution(
+  attrs: Record<string, unknown> | null | undefined,
+): AreaInstitution | null {
+  if (!attrs || attrs.UNITID == null) return null;
+
+  return {
+    uniId: Number(attrs.UNITID),
+    name: String(attrs.INSTNM ?? "Unknown institution"),
+    address: String(attrs.ADDR ?? ""),
+    city: String(attrs.CITY ?? ""),
+    state: String(attrs.STABBR ?? ""),
+    website: normalizeWebsite(attrs.WEBADDR),
+  };
+}
+
 export default function ArcgisMap() {
   const viewRef = useRef<MapView | null>(null);
   const {
@@ -61,6 +98,43 @@ export default function ArcgisMap() {
     setAreaResults,
     setIsSearching,
   } = useCollegesUniversities();
+  const { saved, isSaved, toggleSave } = useSavedUniversities();
+
+
+  const savedRef = useRef({ isSaved, toggleSave });
+  const saveActionRef = useRef<ActionButton | null>(null);
+  const popupHandlesRef = useRef<ResourceHandle[]>([]);
+
+  useEffect(() => {
+    savedRef.current = { isSaved, toggleSave };
+  }, [isSaved, toggleSave]);
+
+
+  const syncSaveAction = () => {
+    const action = saveActionRef.current;
+    if (!action) return;
+
+    const institution = toAreaInstitution(
+      viewRef.current?.popup?.selectedFeature?.attributes,
+    );
+    const alreadySaved =
+      institution !== null && savedRef.current.isSaved(institution.uniId);
+
+    action.icon = alreadySaved ? "heart-f" : "heart";
+    action.title = alreadySaved ? "Remove from saved" : "Save university";
+  };
+
+  // Saving, unsaving, or signing in/out changes the list while a popup is open.
+  useEffect(() => {
+    syncSaveAction();
+  }, [saved]);
+
+  useEffect(() => {
+    return () => {
+      popupHandlesRef.current.forEach((handle) => handle.remove());
+      popupHandlesRef.current = [];
+    };
+  }, []);
 
   const readCamera = (event: Event) => {
     const target = event.target as HTMLArcgisMapElement;
@@ -88,6 +162,37 @@ export default function ArcgisMap() {
     collegesLayerRef.current = collegesLayer;
     target.map?.add(collegesLayer);
     reapplyLayerFilters();
+
+    saveActionRef.current =
+      (collegesLayer.popupTemplate?.actions?.find(
+        (action) => action.id === SAVE_ACTION_ID,
+      ) as ActionButton | undefined) ?? null;
+
+    const view = target.view;
+
+    popupHandlesRef.current.forEach((handle) => handle.remove());
+    popupHandlesRef.current = [
+      // The popup is created lazily on the first map click, so these attach
+      // whenever it comes into existence rather than at load time.
+      reactiveUtils.on(
+        () => view.popup,
+        "trigger-action",
+        (triggerEvent) => {
+          if (triggerEvent.action.id !== SAVE_ACTION_ID) return;
+
+          const institution = toAreaInstitution(
+            view.popup?.selectedFeature?.attributes,
+          );
+          if (institution) {
+            savedRef.current.toggleSave(institution);
+          }
+        },
+      ),
+      reactiveUtils.watch(
+        () => view.popup?.selectedFeature,
+        () => syncSaveAction(),
+      ),
+    ];
   };
 
   const handleError = (event: CustomEvent) => {
@@ -165,16 +270,13 @@ export default function ArcgisMap() {
       ]);
 
       const institutions = result.features
-        .map((feature) => feature.attributes as Record<string, unknown>)
-        .filter((attrs) => attrs.UNITID != null)
-        .map((attrs) => ({
-          uniId: Number(attrs.UNITID),
-          name: String(attrs.INSTNM ?? "Unknown institution"),
-          address: String(attrs.ADDR ?? ""),
-          city: String(attrs.CITY ?? ""),
-          state: String(attrs.STABBR ?? ""),
-          website: normalizeWebsite(attrs.WEBADDR),
-        }));
+        .map((feature) =>
+          toAreaInstitution(feature.attributes as Record<string, unknown>),
+        )
+        .filter(
+          (institution): institution is AreaInstitution =>
+            institution !== null,
+        );
 
       setAreaResults({ institutions, total });
     } catch (error) {
